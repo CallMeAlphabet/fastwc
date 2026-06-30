@@ -1,10 +1,12 @@
 # fastwc
-fastcp — a fast wc rewrite
+fastwc — a fast wc rewrite
 
 ## Table of Contents
 - [Quick Start](#quick-start)
+- [Benchmarks](#benchmarks)
 - [Uninstall](#Uninstall)
 - [Usage](#usage)
+- [Testing Conditions](#testing-conditions)
 
 ## Quick Start
 ```bash
@@ -29,10 +31,25 @@ cargo install --git https://github.com/CallMeAlphabet/fastwc
 fastwc /path/to/file
 ```
 
+## Benchmarks
+
+### Benchmark 1: 1.5 GiB file
+
+| Tool | Time | Speed vs fastwc |
+|------|------|------------------|
+| **fastwc** | **0.16s** | **1x (baseline)** |
+| wc | 23s | 141.6x slower |
+
+***No additional flags were used.***
+
 ## Uninstall
 ```bash
 cargo uninstall fastwc
 ```
 
 ## Usage
-`fastcp` does not add any additional flags to the original `wc`. All flags are the same and behave the same.
+`fastwc` does not add any additional flags to the original `wc`. All flags are the same and behave the same. The --help message was changed though.
+
+## Testing Conditions
+
+https://gist.github.com/CallMeAlphabet/4b7022c4b1a8849e6943526de6a23582

@@ -1,4 +1,4 @@
-# fastcp
+# fastwc
 fastcp — a fast wc rewrite
 
 ## Table of Contents

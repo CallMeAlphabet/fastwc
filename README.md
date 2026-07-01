@@ -40,7 +40,7 @@ fastwc /path/to/file
 | **fastwc** | **0.16s** | **1x (baseline)** |
 | wc | 23s | 141.6x slower |
 
-***No additional flags were used.***
+***The gains in speed are higher the bigger the file.***
 
 ## Uninstall
 ```bash

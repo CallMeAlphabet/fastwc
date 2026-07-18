@@ -1,6 +1,9 @@
 [package]
 name = "fastwc"
 version = "0.2.0"
+description = "a fast wc rewrite"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/CallMeAlphabet/fastwc"
 edition = "2021"
 
 [dependencies]

@@ -8,12 +8,17 @@ fastwc — a fast wc rewrite
 - [Usage](#usage)
 - [Testing Conditions](#testing-conditions)
 
-## Quick Start
-```bash
-# Install
-cargo install --git https://github.com/CallMeAlphabet/fastwc
-```
 
+## Quick Start
+- **On Arch**
+```bash
+paru -S fastwc 
+# or fastwc-bin for a prebuilt release
+```
+- **Non-arch**
+```bash
+cargo install fastwc
+```
 > **Note**: Make sure `~/.cargo/bin` is in your `PATH`. It's added automatically by rustup, but if `fastwc` isn't found, add this to your shell config file:
 > ```bash
 > # If you use Bash:

@@ -34,7 +34,7 @@
 
 use std::sync::atomic::{AtomicI8, Ordering};
 
-extern "C" {
+unsafe extern "C" {
     fn __ctype_get_mb_cur_max() -> libc::size_t;
     fn wcwidth(c: libc::wchar_t) -> libc::c_int;
 }

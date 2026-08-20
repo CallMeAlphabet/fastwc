@@ -120,7 +120,7 @@ fn count_unibyte_nbsp_scalar(data: &[u8], carry_in: bool) -> (u64, u64, u64, u64
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn count_buf_avx2_unibyte_nbsp(data: &[u8], carry_in: bool) -> (u64, u64, u64, u64, bool) {
+unsafe fn count_buf_avx2_unibyte_nbsp(data: &[u8], carry_in: bool) -> (u64, u64, u64, u64, bool) { unsafe {
     const LANE: usize = 32;
 
     let mut lines = 0u64;
@@ -163,7 +163,7 @@ unsafe fn count_buf_avx2_unibyte_nbsp(data: &[u8], carry_in: bool) -> (u64, u64,
 
     let (t_lines, t_words, _, _, t_carry) = count_unibyte_nbsp_scalar(&data[i..], carry);
     (lines + t_lines, words + t_words, data.len() as u64, 0, t_carry)
-}
+}}
 
 #[inline]
 fn count_buf_scalar(data: &[u8], carry_in: bool, want_chars: bool) -> (u64, u64, u64, u64, bool) {
@@ -195,7 +195,7 @@ unsafe fn count_buf_avx2(
     data: &[u8],
     carry_in: bool,
     want_chars: bool,
-) -> (u64, u64, u64, u64, bool) {
+) -> (u64, u64, u64, u64, bool) { unsafe {
     const LANE: usize = 32;
 
     let mut lines = 0u64;
@@ -258,7 +258,7 @@ unsafe fn count_buf_avx2(
     chars += t_chars;
 
     (lines, words, data.len() as u64, chars, t_carry)
-}
+}}
 
 /// Locate multi-byte whitespace characters inside one 32-byte lane.
 ///
@@ -380,7 +380,7 @@ pub fn count_chars_only(data: &[u8], mode: WsMode) -> u64 {
 /// bandwidth where the AVX2 version does not.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn count_chars_only_avx512(data: &[u8], mode: WsMode) -> u64 {
+unsafe fn count_chars_only_avx512(data: &[u8], mode: WsMode) -> u64 { unsafe {
     const LANE: usize = 64;
     let _ = mode;
 
@@ -483,7 +483,7 @@ unsafe fn count_chars_only_avx512(data: &[u8], mode: WsMode) -> u64 {
     }
 
     chars + chars_tail_scalar(data, i)
-}
+}}
 
 /// Per-position character count for the bytes a vector lane cannot cover.
 #[cfg(target_arch = "x86_64")]
@@ -502,7 +502,7 @@ fn chars_tail_scalar(data: &[u8], from: usize) -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn count_chars_only_avx2(data: &[u8], mode: WsMode) -> u64 {
+unsafe fn count_chars_only_avx2(data: &[u8], mode: WsMode) -> u64 { unsafe {
     const LANE: usize = 32;
     let _ = mode;
 
@@ -591,7 +591,7 @@ unsafe fn count_chars_only_avx2(data: &[u8], mode: WsMode) -> u64 {
     }
 
     chars + chars_tail_scalar(data, i)
-}
+}}
 
 /// Positions of multi-byte whitespace characters, as AVX-512 masks.
 ///
@@ -661,7 +661,7 @@ unsafe fn count_lw_avx512(
     data: &[u8],
     carry_in: bool,
     mode: WsMode,
-) -> (u64, u64, u64, u64, bool) {
+) -> (u64, u64, u64, u64, bool) { unsafe {
     const LANE: usize = 64;
 
     let mut lines = 0u64;
@@ -770,7 +770,7 @@ unsafe fn count_lw_avx512(
         ws::count_scalar_unicode(&data[i..], carry, false, mode);
 
     (lines + t_lines, words + t_words, data.len() as u64, 0, t_carry)
-}
+}}
 
 /// Mask of positions holding a lead byte of a non-ASCII whitespace character.
 ///
@@ -810,7 +810,7 @@ unsafe fn count_buf_avx2_unicode(
     carry_in: bool,
     want_chars: bool,
     mode: WsMode,
-) -> (u64, u64, u64, u64, bool) {
+) -> (u64, u64, u64, u64, bool) { unsafe {
     const LANE: usize = 32;
 
     let mut lines = 0u64;
@@ -1077,7 +1077,7 @@ unsafe fn count_buf_avx2_unicode(
     chars += t_chars;
 
     (lines, words, data.len() as u64, chars, t_carry)
-}
+}}
 
 /// Measure the run of bytes at `data[start..]` that lie in 0x20..=0x7E.
 ///
@@ -1123,7 +1123,7 @@ fn simple_ascii_run_scalar(data: &[u8], start: usize, carry_ws: bool) -> (usize,
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn simple_ascii_run_avx2(data: &[u8], start: usize, carry_ws: bool) -> (usize, u64, bool) {
+unsafe fn simple_ascii_run_avx2(data: &[u8], start: usize, carry_ws: bool) -> (usize, u64, bool) { unsafe {
     const LANE: usize = 32;
 
     let mut i = start;
@@ -1163,7 +1163,7 @@ unsafe fn simple_ascii_run_avx2(data: &[u8], start: usize, carry_ws: bool) -> (u
 
     let (end, w, carry) = simple_ascii_run_scalar(data, i, carry);
     (end, words + w, carry)
-}
+}}
 
 #[cfg(test)]
 mod tests {

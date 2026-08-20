@@ -42,8 +42,8 @@ fastwc /path/to/file
 
 | Tool | Time | Speed vs fastwc |
 |------|------|------------------|
-| **fastwc** | **0.16s** | **1x (baseline)** |
-| wc | 23s | 141.6x slower |
+| **fastwc** | **0.3s** | **1x (baseline)** |
+| wc | 25.3s | 82x slower |
 
 ***The gains in speed are higher the bigger the file.***
 

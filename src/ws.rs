@@ -35,8 +35,24 @@
 use std::sync::atomic::{AtomicI8, Ordering};
 
 unsafe extern "C" {
-    fn __ctype_get_mb_cur_max() -> libc::size_t;
     fn wcwidth(c: libc::wchar_t) -> libc::c_int;
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn __ctype_get_mb_cur_max() -> libc::size_t;
+}
+
+fn mb_cur_max() -> libc::size_t {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        __ctype_get_mb_cur_max()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS / BSD: MB_CUR_MAX is a locale-sensitive macro.
+        unsafe { libc::MB_CUR_MAX as libc::size_t }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -58,7 +74,7 @@ impl WsMode {
     pub fn from_env() -> Self {
         let mb_cur_max = unsafe {
             libc::setlocale(libc::LC_ALL, c"".as_ptr());
-            __ctype_get_mb_cur_max()
+            mb_cur_max()
         };
         WsMode {
             unicode: mb_cur_max > 1,

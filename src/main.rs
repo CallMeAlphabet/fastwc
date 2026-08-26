@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 //! Copyright 2026 CallMeAlphabet (ItzAlphabet)
 //!
 //! Licensed under the Apache License, Version 2.0 (the "License");
@@ -713,6 +715,7 @@ fn count_path(path: Option<&OsString>, opts: &Options) -> io::Result<CountOutcom
         let mmap = unsafe { Mmap::map(&file)? };
         #[cfg(unix)]
         unsafe {
+            #[cfg(unix)]
             libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_SEQUENTIAL);
         }
         let data: &[u8] = &mmap;

@@ -48,9 +48,15 @@ fn mb_cur_max() -> libc::size_t {
     unsafe {
         __ctype_get_mb_cur_max()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe {
+        unsafe extern "C" {
+            fn ___mb_cur_max() -> libc::c_int;
+        }
+        ___mb_cur_max() as libc::size_t
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
     {
-        // macOS / BSD: MB_CUR_MAX is a locale-sensitive macro.
         unsafe { libc::MB_CUR_MAX as libc::size_t }
     }
 }

@@ -16,7 +16,6 @@
 //! LLVM lowers `Simd<u8, 32>` to AVX2 on x86_64 and NEON (2×16) on aarch64.
 
 use std::simd::cmp::{SimdPartialEq, SimdPartialOrd};
-use std::simd::num::SimdUint;
 use std::simd::{Mask, Simd};
 
 use crate::ws::{self, WsMode};
@@ -196,14 +195,10 @@ fn ws_seq_masks(data: &[u8], i: usize, nbsp: bool) -> (u32, u32) {
         0
     };
 
-    let tail = next2 ^ high;
     // U+2000..U+2006, U+2008..U+200A (and U+2007 if GNU)
-    let mut low = tail.simd_lt(V::splat(0x0b)) & tail.simd_gt(V::splat(0xFF)); // signed -1 via 0xFF as u8 cmp?
-    // portable_simd unsigned: we need signed compare on xor-biased tail.
-    // tail = next2 ^ 0x80, then signed: values 0..0x0A are the low separators.
-    // Use unsigned: after xor 0x80, 0x00..=0x0A stay 0x80..=0x8A.
-    let t = next2 ^ V::splat(0x80);
-    low = t.simd_ge(V::splat(0x80)) & t.simd_le(V::splat(0x8A));
+    // After xor 0x80 the low separators 0x00..=0x0A stay in 0x80..=0x8A.
+    let t = next2 ^ high;
+    let mut low = t.simd_ge(V::splat(0x80)) & t.simd_le(V::splat(0x8A));
     if !nbsp {
         low &= !t.simd_eq(V::splat(0x87)); // U+2007
     }
@@ -227,6 +222,7 @@ pub fn count_chars_only(data: &[u8], mode: WsMode) -> u64 {
     ws::count_scalar_unicode(data, true, true, mode).3
 }
 
+#[cfg(test)]
 fn chars_tail_scalar(data: &[u8], from: usize) -> u64 {
     let mut n = 0u64;
     for i in from..data.len() {

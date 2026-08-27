@@ -1301,3 +1301,4 @@ mod tests {
         assert!(out.read_err.is_some(), "the error must still be reported");
     }
 }
+

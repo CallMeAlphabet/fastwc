@@ -129,7 +129,11 @@ fn print_help() -> ! {
 }
 
 fn print_help_body(on: bool) {
-    let mut page = HelpPage::new("fastwc 0.1.0 - a high-performance, GNU-compatible wc reimplementation")
+    let mut page = HelpPage::new(format!(
+        "{} {} - a high-performance, GNU-compatible wc reimplementation",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    ))
         .usage("fastwc [OPTION]... [FILE]...")
         .usage("fastwc [OPTION]... --files0-from=F")
         .usage("fastwc [OPTION]... -          read from stdin explicitly")
@@ -154,7 +158,11 @@ fn print_version() -> ! {
     } else {
         ("", "", "")
     };
-    println!("{bold}{cyan}fastwc{reset} 0.1.0 {bold}(GNU wc compatible){reset}");
+    println!(
+        "{bold}{cyan}{}{reset} {} {bold}(GNU wc compatible){reset}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
     std::process::exit(0);
 }
 

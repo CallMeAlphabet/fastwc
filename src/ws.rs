@@ -48,6 +48,7 @@ fn mb_cur_max() -> libc::size_t {
     unsafe {
         __ctype_get_mb_cur_max()
     }
+    // Darwin/BSD: `MB_CUR_MAX` is a libc macro, not a rust-libc constant.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     unsafe {
         unsafe extern "C" {

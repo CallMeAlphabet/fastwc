@@ -1,4 +1,6 @@
-#![feature(portable_simd)]
+// `std::simd` is nightly-only (`portable_simd`, rust-lang/rust#86656), so the
+// gate is applied by `build.rs` only when the active toolchain accepts it.
+#![cfg_attr(simd_portable, feature(portable_simd))]
 
 //! Copyright 2026 CallMeAlphabet (ItzAlphabet)
 //!
@@ -26,8 +28,14 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
-mod simd;
 mod ws;
+// Vectorised kernel on nightly-capable toolchains, pure-Rust fallback on every
+// other one. Both expose the same four entry points.
+#[cfg(simd_portable)]
+mod simd;
+#[cfg(not(simd_portable))]
+#[path = "simd_scalar.rs"]
+mod simd;
 use simd::count_buf_mode;
 use ws::WsMode;
 

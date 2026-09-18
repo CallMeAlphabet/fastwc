@@ -1,6 +1,6 @@
 [package]
 name = "fastwc"
-version = "0.2.5"
+version = "0.2.6"
 description = "a fast wc rewrite"
 license = "Apache-2.0"
 repository = "https://github.com/CallMeAlphabet/fastwc"

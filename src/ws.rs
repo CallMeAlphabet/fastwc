@@ -90,9 +90,15 @@ impl WsMode {
     }
 }
 
+// Only the portable SIMD kernel pattern-matches on these lead bytes; the
+// scalar fallback decodes every sequence, so they look dead without `simd`.
+#[cfg_attr(not(simd_portable), allow(dead_code))]
 pub const LEAD_C2: u8 = 0xC2; // U+00A0
+#[cfg_attr(not(simd_portable), allow(dead_code))]
 pub const LEAD_E1: u8 = 0xE1; // U+1680
+#[cfg_attr(not(simd_portable), allow(dead_code))]
 pub const LEAD_E2: u8 = 0xE2; // U+2000..U+206F block
+#[cfg_attr(not(simd_portable), allow(dead_code))]
 pub const LEAD_E3: u8 = 0xE3; // U+3000
 
 /// Byte 0xA0, a delimiter in unibyte locales unless POSIXLY_CORRECT.

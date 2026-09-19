@@ -5,6 +5,7 @@ description = "a fast wc rewrite"
 license = "Apache-2.0"
 repository = "https://github.com/CallMeAlphabet/fastwc"
 edition = "2024"
+rust-version = "1.86"
 
 [dependencies]
 memmap2 = "0.9"

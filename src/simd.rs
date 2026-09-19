@@ -15,19 +15,215 @@
 //! Portable SIMD counting kernel for fastwc.
 //! LLVM lowers `Simd<u8, 32>` to AVX2 on x86_64 and NEON (2×16) on aarch64.
 
-use std::simd::cmp::{SimdPartialEq, SimdPartialOrd};
-use std::simd::{Mask, Simd};
-
 use crate::ws::{self, WsMode};
 
 const LANE: usize = 32;
-type V = Simd<u8, LANE>;
-type M = Mask<i8, LANE>;
 
-/// Kept for debug output / ABI compatibility; always true because the
-/// portable kernel is compiled for every target.
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64 as arch;
+#[cfg(target_arch = "x86")]
+use std::arch::x86 as arch;
+
+/// One 32-byte lane and the mask type it compares into.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+mod lane {
+    use super::arch::*;
+
+    #[derive(Clone, Copy)]
+    pub struct V(pub __m256i);
+    #[derive(Clone, Copy)]
+    pub struct M(pub __m256i);
+
+    impl V {
+        #[inline(always)]
+        pub fn splat(b: u8) -> V {
+            unsafe { V(_mm256_set1_epi8(b as i8)) }
+        }
+        #[inline(always)]
+        pub fn from_slice(s: &[u8]) -> V {
+            unsafe { V(_mm256_loadu_si256(s.as_ptr() as *const __m256i)) }
+        }
+        #[inline(always)]
+        pub fn simd_eq(self, o: V) -> M {
+            unsafe { M(_mm256_cmpeq_epi8(self.0, o.0)) }
+        }
+        #[inline(always)]
+        pub fn simd_le(self, o: V) -> M {
+            unsafe { M(_mm256_cmpeq_epi8(_mm256_min_epu8(self.0, o.0), self.0)) }
+        }
+        #[inline(always)]
+        pub fn simd_ge(self, o: V) -> M {
+            unsafe { M(_mm256_cmpeq_epi8(_mm256_max_epu8(self.0, o.0), self.0)) }
+        }
+    }
+    impl std::ops::BitAnd for V {
+        type Output = V;
+        #[inline(always)]
+        fn bitand(self, o: V) -> V {
+            unsafe { V(_mm256_and_si256(self.0, o.0)) }
+        }
+    }
+    impl std::ops::BitXor for V {
+        type Output = V;
+        #[inline(always)]
+        fn bitxor(self, o: V) -> V {
+            unsafe { V(_mm256_xor_si256(self.0, o.0)) }
+        }
+    }
+    impl M {
+        #[inline(always)]
+        pub fn splat(b: bool) -> M {
+            unsafe { M(_mm256_set1_epi8(if b { -1 } else { 0 })) }
+        }
+        #[inline(always)]
+        pub fn to_bitmask(self) -> u32 {
+            unsafe { _mm256_movemask_epi8(self.0) as u32 }
+        }
+    }
+    impl std::ops::BitAnd for M {
+        type Output = M;
+        #[inline(always)]
+        fn bitand(self, o: M) -> M {
+            unsafe { M(_mm256_and_si256(self.0, o.0)) }
+        }
+    }
+    impl std::ops::BitAndAssign for M {
+        #[inline(always)]
+        fn bitand_assign(&mut self, o: M) {
+            *self = *self & o;
+        }
+    }
+    impl std::ops::BitOr for M {
+        type Output = M;
+        #[inline(always)]
+        fn bitor(self, o: M) -> M {
+            unsafe { M(_mm256_or_si256(self.0, o.0)) }
+        }
+    }
+    impl std::ops::BitOrAssign for M {
+        #[inline(always)]
+        fn bitor_assign(&mut self, o: M) {
+            *self = *self | o;
+        }
+    }
+    impl std::ops::Not for M {
+        type Output = M;
+        #[inline(always)]
+        fn not(self) -> M {
+            unsafe { M(_mm256_xor_si256(self.0, _mm256_set1_epi8(-1))) }
+        }
+    }
+}
+
+/// Same lane API on plain arrays for every other architecture; the compiler
+/// auto-vectorises these loops with whatever the target offers.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+mod lane {
+    use super::LANE;
+
+    #[derive(Clone, Copy)]
+    pub struct V(pub [u8; LANE]);
+    #[derive(Clone, Copy)]
+    pub struct M(pub [bool; LANE]);
+
+    impl V {
+        #[inline(always)]
+        pub fn splat(b: u8) -> V {
+            V([b; LANE])
+        }
+        #[inline(always)]
+        pub fn from_slice(s: &[u8]) -> V {
+            V(s[..LANE].try_into().unwrap())
+        }
+        #[inline(always)]
+        pub fn simd_eq(self, o: V) -> M {
+            M(std::array::from_fn(|i| self.0[i] == o.0[i]))
+        }
+        #[inline(always)]
+        pub fn simd_le(self, o: V) -> M {
+            M(std::array::from_fn(|i| self.0[i] <= o.0[i]))
+        }
+        #[inline(always)]
+        pub fn simd_ge(self, o: V) -> M {
+            M(std::array::from_fn(|i| self.0[i] >= o.0[i]))
+        }
+    }
+    impl std::ops::BitAnd for V {
+        type Output = V;
+        #[inline(always)]
+        fn bitand(self, o: V) -> V {
+            V(std::array::from_fn(|i| self.0[i] & o.0[i]))
+        }
+    }
+    impl std::ops::BitXor for V {
+        type Output = V;
+        #[inline(always)]
+        fn bitxor(self, o: V) -> V {
+            V(std::array::from_fn(|i| self.0[i] ^ o.0[i]))
+        }
+    }
+    impl M {
+        #[inline(always)]
+        pub fn splat(b: bool) -> M {
+            M([b; LANE])
+        }
+        #[inline(always)]
+        pub fn to_bitmask(self) -> u32 {
+            let mut m = 0u32;
+            for i in 0..LANE {
+                m |= (self.0[i] as u32) << i;
+            }
+            m
+        }
+    }
+    impl std::ops::BitAnd for M {
+        type Output = M;
+        #[inline(always)]
+        fn bitand(self, o: M) -> M {
+            M(std::array::from_fn(|i| self.0[i] & o.0[i]))
+        }
+    }
+    impl std::ops::BitAndAssign for M {
+        #[inline(always)]
+        fn bitand_assign(&mut self, o: M) {
+            *self = *self & o;
+        }
+    }
+    impl std::ops::BitOr for M {
+        type Output = M;
+        #[inline(always)]
+        fn bitor(self, o: M) -> M {
+            M(std::array::from_fn(|i| self.0[i] | o.0[i]))
+        }
+    }
+    impl std::ops::BitOrAssign for M {
+        #[inline(always)]
+        fn bitor_assign(&mut self, o: M) {
+            *self = *self | o;
+        }
+    }
+    impl std::ops::Not for M {
+        type Output = M;
+        #[inline(always)]
+        fn not(self) -> M {
+            M(std::array::from_fn(|i| !self.0[i]))
+        }
+    }
+}
+
+use lane::{M, V};
+
+/// Kept for debug output / ABI compatibility; true when the AVX2 lane code
+/// can run on this CPU. Every entry point is dispatched on the same check.
 pub fn avx2_available() -> bool {
-    true
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+    {
+        true
+    }
 }
 
 #[inline(always)]
@@ -35,22 +231,22 @@ fn is_ws_byte(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
-#[inline]
+#[inline(always)]
 fn load_at(data: &[u8], i: usize) -> V {
     V::from_slice(&data[i..i + LANE])
 }
 
-#[inline]
+#[inline(always)]
 fn bitmask(m: M) -> u32 {
-    m.to_bitmask() as u32
+    m.to_bitmask()
 }
 
-#[inline]
+#[inline(always)]
 fn eq_splat(chunk: V, b: u8) -> M {
     chunk.simd_eq(V::splat(b))
 }
 
-#[inline]
+#[inline(always)]
 fn ascii_ws_mask(chunk: V) -> M {
     eq_splat(chunk, b'\n')
         | eq_splat(chunk, b' ')
@@ -58,6 +254,39 @@ fn ascii_ws_mask(chunk: V) -> M {
         | eq_splat(chunk, 0x0b)
         | eq_splat(chunk, 0x0c)
         | eq_splat(chunk, b'\r')
+}
+
+fn count_buf_portable(data: &[u8], carry_in: bool, want_chars: bool) -> (u64, u64, u64, u64, bool) {
+    if avx2_available() {
+        return unsafe { count_buf_portable_impl(data, carry_in, want_chars) };
+    }
+    count_buf_scalar(data, carry_in, want_chars)
+}
+
+fn count_buf_unibyte_nbsp(data: &[u8], carry_in: bool) -> (u64, u64, u64, u64, bool) {
+    if avx2_available() {
+        return unsafe { count_buf_unibyte_nbsp_impl(data, carry_in) };
+    }
+    count_unibyte_nbsp_scalar(data, carry_in)
+}
+
+fn count_buf_unicode(
+    data: &[u8],
+    carry_in: bool,
+    want_chars: bool,
+    mode: WsMode,
+) -> (u64, u64, u64, u64, bool) {
+    if avx2_available() {
+        return unsafe { count_buf_unicode_impl(data, carry_in, want_chars, mode) };
+    }
+    ws::count_scalar_unicode(data, carry_in, want_chars, mode)
+}
+
+pub fn simple_ascii_run(data: &[u8], start: usize, carry_ws: bool, avx2: bool) -> (usize, u64, bool) {
+    if avx2 {
+        return unsafe { simple_ascii_run_impl(data, start, carry_ws) };
+    }
+    simple_ascii_run_scalar(data, start, carry_ws)
 }
 
 pub fn count_buf(data: &[u8], carry_in: bool, want_chars: bool) -> (u64, u64, u64, u64, bool) {
@@ -81,7 +310,8 @@ pub fn count_buf_mode(
     count_buf_unicode(data, carry_in, want_chars, mode)
 }
 
-fn count_buf_unibyte_nbsp(data: &[u8], carry_in: bool) -> (u64, u64, u64, u64, bool) {
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), target_feature(enable = "avx2"))]
+fn count_buf_unibyte_nbsp_impl(data: &[u8], carry_in: bool) -> (u64, u64, u64, u64, bool) {
     let mut lines = 0u64;
     let mut words = 0u64;
     let mut carry = carry_in;
@@ -140,7 +370,8 @@ fn count_buf_scalar(data: &[u8], carry_in: bool, want_chars: bool) -> (u64, u64,
     (lines, words, data.len() as u64, chars, prev_ws)
 }
 
-fn count_buf_portable(data: &[u8], carry_in: bool, want_chars: bool) -> (u64, u64, u64, u64, bool) {
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), target_feature(enable = "avx2"))]
+fn count_buf_portable_impl(data: &[u8], carry_in: bool, want_chars: bool) -> (u64, u64, u64, u64, bool) {
     let mut lines = 0u64;
     let mut words = 0u64;
     let mut chars = 0u64;
@@ -168,7 +399,8 @@ fn count_buf_portable(data: &[u8], carry_in: bool, want_chars: bool) -> (u64, u6
 }
 
 /// Positions of 2-byte and 3-byte whitespace leads in one 32-byte lane.
-fn ws_seq_masks(data: &[u8], i: usize, nbsp: bool) -> (u32, u32) {
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), target_feature(enable = "avx2"))]
+fn ws_seq_masks_impl(data: &[u8], i: usize, nbsp: bool) -> (u32, u32) {
     let chunk = load_at(data, i);
     let next1 = V::from_slice(&data[i + 1..i + 1 + LANE]);
     let next2 = V::from_slice(&data[i + 2..i + 2 + LANE]);
@@ -236,7 +468,8 @@ fn chars_tail_scalar(data: &[u8], from: usize) -> u64 {
     n
 }
 
-fn count_buf_unicode(
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), target_feature(enable = "avx2"))]
+fn count_buf_unicode_impl(
     data: &[u8],
     carry_in: bool,
     want_chars: bool,
@@ -248,7 +481,7 @@ fn count_buf_unicode(
         if data.iter().any(|&b| b >= 0x80) {
             return ws::count_scalar_unicode(data, carry_in, want_chars, mode);
         }
-        return count_buf_portable(data, carry_in, true);
+        return count_buf_portable_impl(data, carry_in, true);
     }
     let mut lines = 0u64;
     let mut words = 0u64;
@@ -261,7 +494,7 @@ fn count_buf_unicode(
         let ascii_ws_bits = bitmask(ascii_ws_mask(chunk));
         let nl_bits = bitmask(eq_nl);
 
-        let (ws2, ws3) = ws_seq_masks(data, i, mode.nbsp);
+        let (ws2, ws3) = ws_seq_masks_impl(data, i, mode.nbsp);
         let wide = ((ws2 as u64) | ((ws2 as u64) << 1))
             | ((ws3 as u64) | ((ws3 as u64) << 1) | ((ws3 as u64) << 2));
         let ws_all = ascii_ws_bits | (wide as u32) | ws_carry;
@@ -278,7 +511,8 @@ fn count_buf_unicode(
     (lines + t_lines, words + t_words, data.len() as u64, 0, t_carry)
 }
 
-pub fn simple_ascii_run(data: &[u8], start: usize, carry_ws: bool, _avx2: bool) -> (usize, u64, bool) {
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), target_feature(enable = "avx2"))]
+fn simple_ascii_run_impl(data: &[u8], start: usize, carry_ws: bool) -> (usize, u64, bool) {
     let mut i = start;
     let mut words = 0u64;
     let mut carry = carry_ws;

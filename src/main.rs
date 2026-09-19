@@ -634,24 +634,27 @@ fn count_stdin_bytes(opts: &Options) -> CountOutcome {
                     bytes = (target - cur) as u64;
                 }
             }
-        } else {
-            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-            if devnull >= 0 {
-                loop {
-                    let n = libc::splice(fd, std::ptr::null_mut(), devnull, std::ptr::null_mut(), 1 << 30, libc::SPLICE_F_MOVE);
-                    if n > 0 {
-                        bytes += n as u64;
-                    } else if n == 0 {
-                        libc::close(devnull);
-                        return CountOutcome {
-                            counts: Counts { bytes, ..Counts::default() },
-                            read_err: None,
-                        };
-                    } else if *libc::__errno_location() != libc::EINTR {
-                        break;
+        } else if cfg!(target_os = "linux") {
+            #[cfg(target_os = "linux")]
+            {
+                let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if devnull >= 0 {
+                    loop {
+                        let n = libc::splice(fd, std::ptr::null_mut(), devnull, std::ptr::null_mut(), 1 << 30, libc::SPLICE_F_MOVE);
+                        if n > 0 {
+                            bytes += n as u64;
+                        } else if n == 0 {
+                            libc::close(devnull);
+                            return CountOutcome {
+                                counts: Counts { bytes, ..Counts::default() },
+                                read_err: None,
+                            };
+                        } else if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                            break;
+                        }
                     }
+                    libc::close(devnull);
                 }
-                libc::close(devnull);
             }
         }
     }

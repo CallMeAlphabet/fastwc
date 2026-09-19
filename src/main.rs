@@ -26,6 +26,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
 use std::process::ExitCode;
 
 mod ws;
@@ -599,12 +600,74 @@ fn incomplete_tail(data: &[u8], mode: WsMode) -> usize {
     0
 }
 
+fn only_bytes(opts: &Options) -> bool {
+    opts.print_bytes
+        && !opts.print_lines
+        && !opts.print_words
+        && !opts.print_chars
+        && !opts.print_linelength
+}
+
+fn count_stdin_bytes(opts: &Options) -> CountOutcome {
+    let stdin = io::stdin();
+    let mut lock = stdin.lock();
+    let fd = lock.as_raw_fd();
+    let mut bytes = 0u64;
+
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_size > 0 {
+            let size = st.st_size;
+            if size % (libc::sysconf(libc::_SC_PAGESIZE) as libc::off_t) != 0 {
+                let cur = libc::lseek(fd, 0, libc::SEEK_CUR);
+                let end = libc::lseek(fd, 0, libc::SEEK_END);
+                if cur >= 0 && end >= cur {
+                    return CountOutcome {
+                        counts: Counts { bytes: (end - cur) as u64, ..Counts::default() },
+                        read_err: None,
+                    };
+                }
+            } else {
+                let cur = libc::lseek(fd, 0, libc::SEEK_CUR);
+                let target = size - size % (st.st_blksize as libc::off_t + 1);
+                if cur >= 0 && target > cur && libc::lseek(fd, target, libc::SEEK_SET) == target {
+                    bytes = (target - cur) as u64;
+                }
+            }
+        } else {
+            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if devnull >= 0 {
+                loop {
+                    let n = libc::splice(fd, std::ptr::null_mut(), devnull, std::ptr::null_mut(), 1 << 30, libc::SPLICE_F_MOVE);
+                    if n > 0 {
+                        bytes += n as u64;
+                    } else if n == 0 {
+                        libc::close(devnull);
+                        return CountOutcome {
+                            counts: Counts { bytes, ..Counts::default() },
+                            read_err: None,
+                        };
+                    } else if *libc::__errno_location() != libc::EINTR {
+                        break;
+                    }
+                }
+                libc::close(devnull);
+            }
+        }
+    }
+
+    let mut out = count_stream(&mut lock, opts);
+    out.counts.bytes += bytes;
+    out
+}
+
 fn count_stream(reader: &mut dyn Read, opts: &Options) -> CountOutcome {
     const BUF: usize = 1 << 20;
     // Room to prepend a partial character carried over from the last read.
     let mut buf = vec![0u8; BUF + 4];
     let want_chars = opts.print_chars;
     let mode = opts.ws_mode;
+    let only_bytes = only_bytes(opts);
 
     let mut total = Counts::default();
     let mut carry_ws = true;
@@ -625,6 +688,10 @@ fn count_stream(reader: &mut dyn Read, opts: &Options) -> CountOutcome {
             break;
         }
         let avail = prev + n;
+        if only_bytes {
+            total.bytes += n as u64;
+            continue;
+        }
 
         // Hold back a trailing partial sequence so it is decoded as one
         // character once the rest of it arrives.
@@ -693,6 +760,9 @@ fn count_path(path: Option<&OsString>, opts: &Options) -> io::Result<CountOutcom
     let is_stdin = path.is_none() || (path.map(|p| p.as_bytes() == b"-").unwrap_or(false) && !opts.end_of_opts);
 
     if is_stdin {
+        if only_bytes(opts) {
+            return Ok(count_stdin_bytes(opts));
+        }
         let stdin = io::stdin();
         let mut lock = stdin.lock();
         return Ok(count_stream(&mut lock, opts));
@@ -701,11 +771,7 @@ fn count_path(path: Option<&OsString>, opts: &Options) -> io::Result<CountOutcom
     let path = path.unwrap();
     let meta = fs::metadata(path)?;
 
-    let only_bytes = opts.print_bytes
-        && !opts.print_lines
-        && !opts.print_words
-        && !opts.print_chars
-        && !opts.print_linelength;
+    let only_bytes = only_bytes(opts);
 
     // Opening happens before the -c shortcut: an unreadable file is an error
     // even when its size alone would answer the question.

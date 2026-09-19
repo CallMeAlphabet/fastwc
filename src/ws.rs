@@ -94,11 +94,8 @@ impl WsMode {
 // scalar fallback decodes every sequence, so they look dead without `simd`.
 #[cfg_attr(not(simd_portable), allow(dead_code))]
 pub const LEAD_C2: u8 = 0xC2; // U+00A0
-#[cfg_attr(not(simd_portable), allow(dead_code))]
 pub const LEAD_E1: u8 = 0xE1; // U+1680
-#[cfg_attr(not(simd_portable), allow(dead_code))]
 pub const LEAD_E2: u8 = 0xE2; // U+2000..U+206F block
-#[cfg_attr(not(simd_portable), allow(dead_code))]
 pub const LEAD_E3: u8 = 0xE3; // U+3000
 
 /// Byte 0xA0, a delimiter in unibyte locales unless POSIXLY_CORRECT.
@@ -327,7 +324,13 @@ pub fn count_scalar_unicode(
     let mut i = 0usize;
     while i < data.len() {
         let b = data[i];
-        let (cp, len, valid) = if b < 0x80 { (b as u32, 1, true) } else { decode(data, i) };
+        let (cp, len, valid) = if b < 0x80 {
+            (b as u32, 1, true)
+        } else if !want_chars && !matches!(b, LEAD_C2 | LEAD_E1 | LEAD_E2 | LEAD_E3) {
+            (0xFFFD, 1, false)
+        } else {
+            decode(data, i)
+        };
 
         if b == b'\n' {
             lines += 1;

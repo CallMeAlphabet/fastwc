@@ -196,19 +196,19 @@ fn ws_seq_masks(data: &[u8], i: usize, nbsp: bool) -> (u32, u32) {
     };
 
     // U+2000..U+2006, U+2008..U+200A (and U+2007 if GNU)
-    // After xor 0x80 the low separators 0x00..=0x0A stay in 0x80..=0x8A.
+    // After xor 0x80 the low separators' final bytes 0x80..=0x8A land in 0x00..=0x0A.
     let t = next2 ^ high;
-    let mut low = t.simd_ge(V::splat(0x80)) & t.simd_le(V::splat(0x8A));
+    let mut low = t.simd_le(V::splat(0x0A));
     if !nbsp {
-        low &= !t.simd_eq(V::splat(0x87)); // U+2007
+        low &= !t.simd_eq(V::splat(0x07)); // U+2007
     }
-    let mut sep = (t & V::splat(0xfe)).simd_eq(V::splat(0xA8)); // 0x28 ^ 0x80 = 0xA8 (U+2028/2029)
+    let mut sep = (t & V::splat(0xfe)).simd_eq(V::splat(0x28)); // 0xa8 ^ 0x80 = 0x28 (U+2028/2029)
     if nbsp {
-        sep |= t.simd_eq(V::splat(0xAF)); // 0x2f ^ 0x80
+        sep |= t.simd_eq(V::splat(0x2F)); // 0xaf ^ 0x80
     }
-    let mut narrow = t.simd_eq(V::splat(0x9F)); // 0x1f ^ 0x80 U+205F
+    let mut narrow = t.simd_eq(V::splat(0x1F)); // 0x9f ^ 0x80 U+205F
     if nbsp {
-        narrow |= t.simd_eq(V::splat(0xA0)); // U+2060
+        narrow |= t.simd_eq(V::splat(0x20)); // U+2060
     }
     let e2_hit = (at1_80 & (low | sep)) | (at1_81 & narrow);
     let hit = (is_e2 & e2_hit) | (at2_80 & ((is_e1 & at1_9a) | (is_e3 & at1_80)));
@@ -242,12 +242,12 @@ fn count_buf_unicode(
     want_chars: bool,
     mode: WsMode,
 ) -> (u64, u64, u64, u64, bool) {
-    // Multi-byte whitespace matching is correctness-critical; use the scalar
-    // decoder (still vectorised ASCII runs via count_buf_portable for ASCII-only).
-    if data.iter().any(|&b| b >= 0x80) {
-        return ws::count_scalar_unicode(data, carry_in, want_chars, mode);
-    }
+    // Only -m needs every sequence decoded; use the scalar decoder for that
+    // (still vectorised via count_buf_portable for ASCII-only).
     if want_chars {
+        if data.iter().any(|&b| b >= 0x80) {
+            return ws::count_scalar_unicode(data, carry_in, want_chars, mode);
+        }
         return count_buf_portable(data, carry_in, true);
     }
     let mut lines = 0u64;

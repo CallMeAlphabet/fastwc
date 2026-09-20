@@ -44,7 +44,7 @@ fastwc /path/to/file
 |------|------|------------------|
 | **fastwc** | **0.23s** | **1x (baseline)** |
 | wc | 25.3s |  110x slower |
-| utils/wc | 33.1s | 143.91x slower
+| uutils/wc | 33.1s | 143.91x slower
 
 ***The gains in speed are higher the bigger the file.***
 

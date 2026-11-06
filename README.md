@@ -39,7 +39,7 @@ These are Hyperfine wall-clock means from 2 runs with `LC_ALL=C.utf8`, default c
 
 | File | Mode | Tool | Mean wall time | fastwc speedup |
 |---|---|---|---:|---:|
-| random-5GiB.bin | default | fastwc 0.2.7 | **4.790 ± 0.673 s** | — |
+| **random-5GiB.bin** | **default** | **fastwc 0.2.7** | **4.790 ± 0.673 s** | **—** |
 | random-5GiB.bin | default | GNU wc | 81.301 ± 0.209 s | 17.0× |
 | random-5GiB.bin | default | cw | 15.711 ± 0.032 s | 3.3× |
 

@@ -8,12 +8,10 @@ fastwc — a fast wc rewrite
 - [Usage](#usage)
 - [Testing Conditions](#testing-conditions)
 
-
 ## Quick Start
 - **On Arch**
 ```bash
-paru -S fastwc 
-# or fastwc-bin for a prebuilt release
+paru -S fastwc
 ```
 - **Non-arch**
 ```bash
@@ -32,21 +30,24 @@ cargo install fastwc
 > ```
 
 ```bash
-# Use it!
 fastwc /path/to/file
 ```
 
 ## Benchmarks
 
-### Benchmark 1: 1.5 GiB file
+These are Hyperfine wall-clock means from 2 runs with `LC_ALL=C.utf8`, default counting mode, and stdout redirected to `/dev/null`. Times are reported as mean ± standard deviation.
 
-| Tool | Time | Speed vs fastwc |
-|------|------|------------------|
-| **fastwc** | **0.23s** | **1x (baseline)** |
-| wc | 25.3s |  110x slower |
-| uutils/wc | 33.1s | 143.91x slower
+| File | Mode | Tool | Mean wall time | fastwc speedup |
+|---|---|---|---:|---:|
+| random-5GiB.bin | default | fastwc 0.2.7 | **4.790 ± 0.673 s** | — |
+| random-5GiB.bin | default | GNU wc | 81.301 ± 0.209 s | 17.0× |
+| random-5GiB.bin | default | cw | 15.711 ± 0.032 s | 3.3× |
 
-***The gains in speed are higher the bigger the file.***
+Reproduce with Hyperfine:
+
+```bash
+hyperfine --shell=default --warmup 0 --runs 2   'LC_ALL=C.utf8 ./target/release/fastwc "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'   'LC_ALL=C.utf8 wc "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'   'LC_ALL=C.utf8 /tmp/cw-0.7.0/bin/cw --threads=2 "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'
+```
 
 ## Uninstall
 ```bash

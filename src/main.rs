@@ -1,19 +1,3 @@
-//! Copyright 2026 CallMeAlphabet (ItzAlphabet)
-//!
-//! Licensed under the Apache License, Version 2.0 (the "License");
-//! you may not use this file except in compliance with the License.
-//! You may obtain a copy of the License at
-//!
-//!    http://www.apache.org/licenses/LICENSE-2.0
-//!
-//! Unless required by applicable law or agreed to in writing, software
-//! distributed under the License is distributed on an "AS IS" BASIS,
-//! WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//! See the License for the specific language governing permissions and
-//! limitations under the License.
-
-//! fastwc — a GNU-wc-compatible `wc` reimplementation, optimized for throughput.
-
 use clihelp::{HelpPage, Row, Section};
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -297,10 +281,6 @@ fn count_complicated(data: &[u8], want_chars: bool, carry_in: (bool, i64), mode:
     while i < data.len() {
         let b = data[i];
 
-        // Printable ASCII plus the plain space, the overwhelmingly common
-        // case, needs no decoding and no table lookups: every byte is one
-        // character of width one that cannot end a line. A whole run is
-        // vectorised, leaving only the word transitions to count.
         if (0x20..0x7f).contains(&b) {
             let run = i;
             let (end, w, carry) = simd::simple_ascii_run(data, i, in_word_ws, avx2);
@@ -314,9 +294,6 @@ fn count_complicated(data: &[u8], want_chars: bool, carry_in: (bool, i64), mode:
             continue;
         }
 
-        // Multi-byte characters that no whitespace set can contain are
-        // measured in bulk: they are all word material, so the run only has
-        // to contribute its width and, at its start, one word transition.
         if mode.unicode && ((0xC3..=0xDF).contains(&b) || (0xE4..=0xEC).contains(&b) || b == 0xEE || b == 0xEF) {
             let (end, n, w) = ws::nonspace_run(data, i);
             if end > i {
@@ -333,9 +310,6 @@ fn count_complicated(data: &[u8], want_chars: bool, carry_in: (bool, i64), mode:
             }
         }
 
-        // In a unibyte locale each byte stands alone; otherwise decode, and
-        // treat a malformed sequence as one byte that is neither a character
-        // nor white space, exactly as GNU's mbrtoc32 error branch does.
         let (cp, char_len, valid) = if b < 0x80 {
             (b as u32, 1, true)
         } else if mode.unicode {
@@ -393,6 +367,76 @@ fn count_complicated(data: &[u8], want_chars: bool, carry_in: (bool, i64), mode:
     (Counts { lines, words, chars, bytes: data.len() as u64, max_line_length: max_len }, in_word_ws, linepos)
 }
 
+fn maxline_buf(data: &[u8], carry_pos: i64, mode: WsMode) -> (i64, i64) {
+    let sample = &data[..data.len().min(4096)];
+    let non_ascii = sample.iter().any(|&b| b >= 0x80);
+    let controls = sample.iter().filter(|&&b| matches!(b, b'\n' | b'\t' | b'\r' | 0x0c)).count();
+    if !non_ascii && controls > 0 {
+        maxline_buf_runs(data, carry_pos, mode)
+    } else {
+        maxline_buf_segments(data, carry_pos, mode)
+    }
+}
+
+fn maxline_buf_runs(data: &[u8], carry_pos: i64, mode: WsMode) -> (i64, i64) {
+    let mut max_len = 0i64;
+    let mut linepos = carry_pos;
+    let avx2 = simd::avx2_available();
+    let mut i = 0usize;
+    while i < data.len() {
+        let b = data[i];
+        if (0x20..0x7f).contains(&b) {
+            let start = i;
+            let (end, _, _) = simd::simple_ascii_run(data, i, true, avx2);
+            linepos += (end - start) as i64;
+            i = end;
+            continue;
+        }
+        match b {
+            b'\n' | b'\r' | 0x0c => {
+                if linepos > max_len { max_len = linepos; }
+                linepos = 0;
+                i += 1;
+            }
+            b'\t' => {
+                linepos += 8 - (linepos % 8);
+                i += 1;
+            }
+            0x00..=0x7f => i += 1,
+            _ if !mode.unicode => i += 1,
+            _ => {
+                let (cp, len, valid) = ws::decode(data, i);
+                if valid { linepos += ws::display_width(cp, true); }
+                i += len;
+            }
+        }
+    }
+    (max_len, linepos)
+}
+
+fn maxline_buf_segments(data: &[u8], carry_pos: i64, mode: WsMode) -> (i64, i64) {
+    let mut max_len = 0i64;
+    let mut linepos = carry_pos;
+    let mut i = 0usize;
+    while i < data.len() {
+        let end = simd::find_line_control(data, i);
+        linepos += simd::segment_width(&data[i..end], mode.unicode);
+        i = end;
+        if i < data.len() {
+            match data[i] {
+                b'\n' | b'\r' | 0x0c => {
+                    if linepos > max_len { max_len = linepos; }
+                    linepos = 0;
+                }
+                b'\t' => linepos += 8 - (linepos % 8),
+                _ => unreachable!(),
+            }
+            i += 1;
+        }
+    }
+    (max_len, linepos)
+}
+
 fn trailing_ws(data: &[u8], mode: WsMode) -> bool {
     if data.is_empty() {
         return true;
@@ -418,6 +462,8 @@ fn count_parallel(
     data: &[u8],
     want_chars: bool,
     want_ws: bool,
+    lines_only: bool,
+    words_only: bool,
     debug: bool,
     mode: WsMode,
 ) -> Counts {
@@ -427,7 +473,6 @@ fn count_parallel(
     let target_chunks = (nthreads * 4).max(1);
     let chunk_size = (data.len() / target_chunks).clamp(256 * 1024, 16 * 1024 * 1024);
 
-    // A multi-byte space must not be cut in half across two threads.
     let chunks: Vec<&[u8]> = if mode.unicode {
         let mut bounds: Vec<usize> = Vec::new();
         let mut off = 0usize;
@@ -455,6 +500,25 @@ fn count_parallel(
             "wc: debug: {} chunk(s) of ~{} bytes across {} thread(s) (avx2={})",
             chunks.len(), chunk_size, nthreads, simd::avx2_available()
         );
+    }
+
+    if lines_only {
+        return chunks
+            .par_iter()
+            .map(|c| Counts {
+                lines: simd::count_lines(c),
+                words: 0,
+                chars: 0,
+                bytes: c.len() as u64,
+                max_line_length: 0,
+            })
+            .reduce(Counts::default, |a, b| Counts {
+                lines: a.lines + b.lines,
+                words: 0,
+                chars: 0,
+                bytes: a.bytes + b.bytes,
+                max_line_length: 0,
+            });
     }
 
     if !want_ws {
@@ -487,8 +551,13 @@ fn count_parallel(
         .par_iter()
         .zip(carries_in.par_iter())
         .map(|(c, &carry_in)| {
-            let (lines, words, bytes, chars, _carry_out) = count_buf_mode(c, carry_in, want_chars, mode);
-            Counts { lines, words, chars, bytes, max_line_length: 0 }
+            if words_only {
+                let (words, bytes, _) = simd::count_words_mode(c, carry_in, mode);
+                Counts { lines: 0, words, chars: 0, bytes, max_line_length: 0 }
+            } else {
+                let (lines, words, bytes, chars, _carry_out) = count_buf_mode(c, carry_in, want_chars, mode);
+                Counts { lines, words, chars, bytes, max_line_length: 0 }
+            }
         })
         .reduce(Counts::default, |a, b| Counts {
             lines: a.lines + b.lines,
@@ -499,17 +568,27 @@ fn count_parallel(
         })
 }
 
-/// `-L` counting spread across threads.
-///
-/// A newline is a hard reset: it zeroes the running column and leaves the
-/// scanner between words. So a chunk that starts just after a newline needs
-/// no state from its predecessor, and the results combine by summing the
-/// counts and taking the maximum of the line lengths. Splitting on newlines
-/// also keeps multi-byte characters intact for free.
-///
-/// Input with no newline in it at all yields a single chunk, which is simply
-/// the serial path.
-fn count_parallel_linelength(data: &[u8], want_chars: bool, mode: WsMode) -> Counts {
+fn combined_use_complicated(c: &[u8], mode: WsMode) -> bool {
+    let sample = &c[..c.len().min(4096)];
+    let non_ascii = sample.iter().any(|&b| b >= 0x80);
+    let hold = incomplete_tail(sample, mode);
+    if non_ascii {
+        mode.unicode && std::str::from_utf8(&sample[..sample.len() - hold]).is_ok()
+    } else {
+        let mut zero_width = 0usize;
+        let mut line_resets = 0usize;
+        for &b in sample {
+            match b {
+                b'\t' | b'\n' | b'\r' | 0x0c => line_resets += 1,
+                0..=8 | 0x0b | 0x0e..=0x1f | 0x7f => zero_width += 1,
+                _ => {}
+            }
+        }
+        zero_width * 8 < sample.len() && line_resets * 8 < sample.len() * 5
+    }
+}
+
+fn count_parallel_linelength(data: &[u8], want_chars: bool, only_length: bool, mode: WsMode) -> Counts {
     if data.is_empty() {
         return Counts::default();
     }
@@ -544,12 +623,32 @@ fn count_parallel_linelength(data: &[u8], want_chars: bool, mode: WsMode) -> Cou
     chunks
         .par_iter()
         .map(|c| {
-            let (counts, _, linepos) = count_complicated(c, want_chars, (true, 0), mode);
-            let mut counts = counts;
-            if linepos > counts.max_line_length {
-                counts.max_line_length = linepos;
+            if only_length {
+                let (max_len, linepos) = maxline_buf(c, 0, mode);
+                return Counts {
+                    lines: 0,
+                    words: 0,
+                    chars: 0,
+                    bytes: c.len() as u64,
+                    max_line_length: max_len.max(linepos),
+                };
             }
-            counts
+            if combined_use_complicated(c, mode) {
+                let (counts, _, linepos) = count_complicated(c, want_chars, (true, 0), mode);
+                let mut counts = counts;
+                if linepos > counts.max_line_length { counts.max_line_length = linepos; }
+                counts
+            } else {
+                let (max_len, linepos) = maxline_buf(c, 0, mode);
+                let (lines, words, bytes, chars, _) = count_buf_mode(c, true, want_chars, mode);
+                Counts {
+                    lines,
+                    words,
+                    chars,
+                    bytes,
+                    max_line_length: max_len.max(linepos),
+                }
+            }
         })
         .reduce(Counts::default, |a, b| Counts {
             lines: a.lines + b.lines,
@@ -560,8 +659,6 @@ fn count_parallel_linelength(data: &[u8], want_chars: bool, mode: WsMode) -> Cou
         })
 }
 
-/// Number of bytes at the tail of a buffer that may be the start of a
-/// multi-byte character continued in the next read. Never more than 3.
 fn incomplete_tail(data: &[u8], mode: WsMode) -> usize {
     if !mode.unicode {
         return 0;
@@ -656,11 +753,14 @@ fn count_stdin_bytes(opts: &Options) -> CountOutcome {
 
 fn count_stream(reader: &mut dyn Read, opts: &Options) -> CountOutcome {
     const BUF: usize = 1 << 20;
-    // Room to prepend a partial character carried over from the last read.
+
     let mut buf = vec![0u8; BUF + 4];
     let want_chars = opts.print_chars;
     let mode = opts.ws_mode;
     let only_bytes = only_bytes(opts);
+    let lines_only = opts.print_lines && !opts.print_words && !opts.print_chars && !opts.print_linelength;
+    let words_only = opts.print_words && !opts.print_lines && !opts.print_chars && !opts.print_linelength;
+    let only_length = opts.print_linelength && !opts.print_lines && !opts.print_words && !opts.print_chars;
 
     let mut total = Counts::default();
     let mut carry_ws = true;
@@ -685,22 +785,48 @@ fn count_stream(reader: &mut dyn Read, opts: &Options) -> CountOutcome {
             total.bytes += n as u64;
             continue;
         }
+        if lines_only {
+            total.lines += simd::count_lines(&buf[..avail]);
+            total.bytes += avail as u64;
+            prev = 0;
+            continue;
+        }
 
-        // Hold back a trailing partial sequence so it is decoded as one
-        // character once the rest of it arrives.
         let hold = incomplete_tail(&buf[..avail], mode);
         let end = avail - hold;
 
         if opts.print_linelength {
-            let (c, in_word_ws, linepos) =
-                count_complicated(&buf[..end], want_chars, (carry_ws, carry_pos), mode);
-            total.lines += c.lines;
-            total.words += c.words;
-            total.chars += c.chars;
-            total.bytes += c.bytes;
-            total.max_line_length = total.max_line_length.max(c.max_line_length);
-            carry_ws = in_word_ws;
-            carry_pos = linepos;
+            if only_length {
+                let (max_len, linepos) = maxline_buf(&buf[..end], carry_pos, mode);
+                total.bytes += end as u64;
+                total.max_line_length = total.max_line_length.max(max_len);
+                carry_pos = linepos;
+            } else if combined_use_complicated(&buf[..end], mode) {
+                let (c, in_word_ws, linepos) =
+                    count_complicated(&buf[..end], want_chars, (carry_ws, carry_pos), mode);
+                total.lines += c.lines;
+                total.words += c.words;
+                total.chars += c.chars;
+                total.bytes += c.bytes;
+                total.max_line_length = total.max_line_length.max(c.max_line_length);
+                carry_ws = in_word_ws;
+                carry_pos = linepos;
+            } else {
+                let (max_len, linepos) = maxline_buf(&buf[..end], carry_pos, mode);
+                let (l, w, b, c, carry_out) = count_buf_mode(&buf[..end], carry_ws, want_chars, mode);
+                total.lines += l;
+                total.words += w;
+                total.chars += c;
+                total.bytes += b;
+                total.max_line_length = total.max_line_length.max(max_len);
+                carry_ws = carry_out;
+                carry_pos = linepos;
+            }
+        } else if words_only {
+            let (w, b, carry_out) = simd::count_words_mode(&buf[..end], carry_ws, mode);
+            total.words += w;
+            total.bytes += b;
+            carry_ws = carry_out;
         } else {
             let (l, w, b, c, carry_out) = count_buf_mode(&buf[..end], carry_ws, want_chars, mode);
             total.lines += l;
@@ -714,18 +840,24 @@ fn count_stream(reader: &mut dyn Read, opts: &Options) -> CountOutcome {
         prev = hold;
     }
 
-    // Whatever is left is a genuine encoding error at end of input.
     if prev > 0 {
         let tail: Vec<u8> = buf[..prev].to_vec();
         if opts.print_linelength {
-            let (c, _, linepos) =
-                count_complicated(&tail, want_chars, (carry_ws, carry_pos), mode);
-            total.lines += c.lines;
-            total.words += c.words;
-            total.chars += c.chars;
-            total.bytes += c.bytes;
-            total.max_line_length = total.max_line_length.max(c.max_line_length);
-            carry_pos = linepos;
+            if only_length {
+                let (max_len, linepos) = maxline_buf(&tail, carry_pos, mode);
+                total.bytes += tail.len() as u64;
+                total.max_line_length = total.max_line_length.max(max_len);
+                carry_pos = linepos;
+            } else {
+                let (c, _, linepos) =
+                    count_complicated(&tail, want_chars, (carry_ws, carry_pos), mode);
+                total.lines += c.lines;
+                total.words += c.words;
+                total.chars += c.chars;
+                total.bytes += c.bytes;
+                total.max_line_length = total.max_line_length.max(c.max_line_length);
+                carry_pos = linepos;
+            }
         } else {
             let (l, w, b, c, _) = count_buf_mode(&tail, carry_ws, want_chars, mode);
             total.lines += l;
@@ -741,9 +873,6 @@ fn count_stream(reader: &mut dyn Read, opts: &Options) -> CountOutcome {
     CountOutcome { counts: total, read_err }
 }
 
-/// Counting outcome. GNU distinguishes a file it could not *open* (no row is
-/// printed) from one that failed while *reading* (the counts gathered so far
-/// are still printed, then the error). `read_err` carries the second case.
 struct CountOutcome {
     counts: Counts,
     read_err: Option<io::Error>,
@@ -766,8 +895,6 @@ fn count_path(path: Option<&OsString>, opts: &Options) -> io::Result<CountOutcom
 
     let only_bytes = only_bytes(opts);
 
-    // Opening happens before the -c shortcut: an unreadable file is an error
-    // even when its size alone would answer the question.
     let file = File::open(path)?;
 
     if only_bytes && meta.is_file() {
@@ -777,8 +904,6 @@ fn count_path(path: Option<&OsString>, opts: &Options) -> io::Result<CountOutcom
         });
     }
 
-    // A directory opens fine; the failure only shows up on read, so GNU emits
-    // a zero row followed by the diagnostic.
     if meta.is_dir() {
         return Ok(CountOutcome {
             counts: Counts::default(),
@@ -796,12 +921,15 @@ fn count_path(path: Option<&OsString>, opts: &Options) -> io::Result<CountOutcom
         let data: &[u8] = &mmap;
 
         if opts.print_linelength {
-            let counts = count_parallel_linelength(data, opts.print_chars, opts.ws_mode);
+            let only_length = !opts.print_lines && !opts.print_words && !opts.print_chars;
+            let counts = count_parallel_linelength(data, opts.print_chars, only_length, opts.ws_mode);
             return Ok(CountOutcome { counts, read_err: None });
         }
 
         let want_ws = opts.print_lines || opts.print_words;
-        let counts = count_parallel(data, opts.print_chars, want_ws, opts.debug, opts.ws_mode);
+        let lines_only = opts.print_lines && !opts.print_words && !opts.print_chars;
+        let words_only = opts.print_words && !opts.print_lines && !opts.print_chars;
+        let counts = count_parallel(data, opts.print_chars, want_ws, lines_only, words_only, opts.debug, opts.ws_mode);
         return Ok(CountOutcome { counts, read_err: None });
     }
 
@@ -809,9 +937,6 @@ fn count_path(path: Option<&OsString>, opts: &Options) -> io::Result<CountOutcom
     Ok(count_stream(&mut f, opts))
 }
 
-/// Split a NUL-separated name list. Zero-length names are preserved rather
-/// than skipped: GNU diagnoses each one and reports its record number, so the
-/// caller needs to see them.
 fn read_files0_from(spec: &str) -> io::Result<Vec<OsString>> {
     let mut data = Vec::new();
     if spec == "-" {
@@ -820,9 +945,6 @@ fn read_files0_from(spec: &str) -> io::Result<Vec<OsString>> {
         File::open(spec)?.read_to_end(&mut data)?;
     }
 
-    // Only a completely empty list has no names at all. Otherwise a trailing
-    // separator merely closes the last name rather than opening a new one, so
-    // a lone NUL still describes one (empty, and therefore invalid) name.
     if data.is_empty() {
         return Ok(Vec::new());
     }
@@ -836,23 +958,11 @@ fn read_files0_from(spec: &str) -> io::Result<Vec<OsString>> {
         .collect())
 }
 
-
-/// Column width for the numeric fields, following GNU's
-/// `get_input_fstatus` / `compute_number_width`.
-///
-/// The width is decided from the *sizes* of the inputs before anything is
-/// counted, not from the counts themselves. Every operand is stat'd and the
-/// regular-file sizes are summed; the width is the digit count of that sum.
-/// A non-regular input (pipe, terminal, character device) forces a minimum of
-/// 7, which is why `wc -lwmcL < file` and `cat file | wc -lwmcL` disagree on
-/// padding for the same bytes. Printing a single number needs no alignment,
-/// so that case short-circuits to width 1 and skips the stat entirely.
 fn compute_widths(opts: &Options, files: &[OsString], nflags: usize) -> [usize; 5] {
     if opts.total_mode == TotalMode::Only {
         return [1; 5];
     }
 
-    // nfiles == 0 is the unknown-length --files0-from case.
     let nfiles = if opts.files_from.is_some() && files.is_empty() {
         0
     } else {
@@ -997,18 +1107,12 @@ fn run() -> io::Result<bool> {
         + opts.print_linelength as usize;
     let widths = compute_widths(&opts, &file_list, nflags);
 
-    // An empty --files0-from list counts nothing at all, whereas an empty
-    // command line means stdin.
     let empty_list = opts.files_from.is_some() && file_list.is_empty();
 
-    // GNU decides on the total row from the number of operands it was given
-    // (`argv_iter_n_args`), so a file that fails to open still counts towards
-    // it: `wc f missing` prints a total row, and `wc missing missing` prints a
-    // zero one.
     let nfiles_seen = if empty_list { 0 } else { file_list.len().max(1) as u64 };
 
     if empty_list {
-        // Nothing to do.
+
     } else if file_list.is_empty() {
         match count_path(None, &opts) {
             Ok(out_c) => {
@@ -1030,8 +1134,6 @@ fn run() -> io::Result<bool> {
         for (i, f) in file_list.iter().enumerate() {
             let display = f.to_string_lossy().into_owned();
 
-            // A zero-length name is diagnosed and skipped, never opened. With
-            // --files0-from the record number is part of the message.
             if f.as_bytes().is_empty() {
                 match &opts.files_from {
                     Some(spec) => diag(
@@ -1044,7 +1146,6 @@ fn run() -> io::Result<bool> {
                 continue;
             }
 
-            // printf - | wc --files0-from=- cannot mean "read stdin twice".
             if opts.files_from.as_deref() == Some("-") && f.as_bytes() == b"-" {
                 diag(
                     &mut out,
@@ -1095,14 +1196,11 @@ fn run() -> io::Result<bool> {
     Ok(ok)
 }
 
-/// Print a diagnostic in GNU's order: stdout is flushed first so the message
-/// lands after the rows already emitted rather than ahead of them.
 fn diag(out: &mut dyn Write, msg: std::fmt::Arguments) {
     let _ = out.flush();
     eprintln!("wc: {msg}");
 }
 
-/// strerror text without Rust's trailing "(os error N)", matching GNU output.
 fn errmsg(e: &io::Error) -> String {
     match e.raw_os_error() {
         Some(code) => {
@@ -1154,7 +1252,7 @@ mod tests {
     fn carriage_return_and_formfeed_reset_linepos() {
         assert_eq!(complicated(b"abcdef\rxy", GNU).max_line_length, 6);
         assert_eq!(complicated(b"abcdef\x0cxy", GNU).max_line_length, 6);
-        // Vertical tab keeps the column but ends the word.
+
         assert_eq!(complicated(b"abc\x0bdef", GNU).max_line_length, 6);
         assert_eq!(complicated(b"abc\x0bdef", GNU).words, 2);
     }
@@ -1167,7 +1265,7 @@ mod tests {
 
     #[test]
     fn unibyte_locale_treats_high_bytes_as_zero_width() {
-        // LC_ALL=C: "caf\xc3\xa9" is five bytes, only three printable.
+
         let c = complicated(b"caf\xc3\xa9", CLOC);
         assert_eq!(c.max_line_length, 3);
         assert_eq!(c.chars, 5);
@@ -1189,7 +1287,7 @@ mod tests {
         assert_eq!(c.bytes, 6);
         assert_eq!(c.chars, 0);
         assert_eq!(c.max_line_length, 0);
-        // Encoding errors are word material, and these are all contiguous.
+
         assert_eq!(c.words, 1);
     }
 
@@ -1199,26 +1297,25 @@ mod tests {
             libc::setlocale(libc::LC_ALL, c"C.utf8".as_ptr());
         }
         assert_eq!(complicated("\u{4e2d}\u{6587}".as_bytes(), GNU).max_line_length, 4);
-        // U+2028 is a separator with wcwidth -1; it must not subtract.
+
         assert!(complicated("ab\u{2028}cd".as_bytes(), GNU).max_line_length >= 0);
     }
 
     #[test]
     fn incomplete_tail_holds_back_only_split_sequences() {
-        // A whole character is never held back.
+
         assert_eq!(incomplete_tail("a\u{2003}".as_bytes(), GNU), 0);
-        // A truncated one is, so the next read can complete it.
+
         assert_eq!(incomplete_tail(b"a\xe2\x80", GNU), 2);
         assert_eq!(incomplete_tail(b"a\xe2", GNU), 1);
         assert_eq!(incomplete_tail(b"a\xc2", GNU), 1);
-        // Never in a unibyte locale, where bytes stand alone.
+
         assert_eq!(incomplete_tail(b"a\xe2\x80", CLOC), 0);
     }
 
     #[test]
     fn stream_matches_whole_buffer_across_read_boundary() {
-        // A separator straddling the 1 MiB read boundary must still be one
-        // character, at every possible split offset.
+
         for off in -3i64..3 {
             let pos = ((1usize << 20) as i64 + off) as usize;
             let mut data = vec![b'a'; pos];
@@ -1239,16 +1336,13 @@ mod tests {
         }
     }
 
-    /// Bug #8: the field width comes from the input *sizes*, discovered by
-    /// stat before counting, never from the counts themselves.
     #[test]
     fn width_is_derived_from_file_sizes_not_from_counts() {
         let dir = std::env::temp_dir().join("fastwc_width_test");
         let _ = fs::create_dir_all(&dir);
         let big = dir.join("big");
         let small = dir.join("small");
-        // 12345 bytes of newlines: 5-digit size, but only 5 digits of size and
-        // a 5-digit line count that must not be what drives the width.
+
         fs::write(&big, vec![b'\n'; 12345]).unwrap();
         fs::write(&small, b"hi\n").unwrap();
 
@@ -1260,10 +1354,8 @@ mod tests {
             ..Options::default()
         };
 
-        // 12345 + 3 = 12348 bytes => 5 columns, for every field.
         assert_eq!(compute_widths(&opts, &files, 2), [5; 5]);
 
-        // One file and one flag needs no alignment at all.
         let one = vec![OsString::from(&big)];
         let single = Options {
             print_lines: true,
@@ -1272,7 +1364,6 @@ mod tests {
         };
         assert_eq!(compute_widths(&single, &one, 1), [1; 5]);
 
-        // ...but one file with two flags is padded to the size width.
         let two_flags = Options {
             print_lines: true,
             print_words: true,
@@ -1281,7 +1372,6 @@ mod tests {
         };
         assert_eq!(compute_widths(&two_flags, &one, 2), [5; 5]);
 
-        // --total=only prints a single row, so it is never padded.
         let total_only = Options {
             print_lines: true,
             print_words: true,
@@ -1291,7 +1381,6 @@ mod tests {
         };
         assert_eq!(compute_widths(&total_only, &files, 2), [1; 5]);
 
-        // A missing operand is skipped, not fatal, and not counted.
         let missing = dir.join("does_not_exist");
         let with_missing = vec![OsString::from(&small), OsString::from(&missing)];
         let opts_missing = Options {
@@ -1302,7 +1391,6 @@ mod tests {
         };
         assert_eq!(compute_widths(&opts_missing, &with_missing, 2), [1; 5]);
 
-        // A non-regular input forces GNU's minimum width of 7.
         let with_dev = vec![OsString::from(&small), OsString::from("/dev/null")];
         let opts_dev = Options {
             print_lines: true,
@@ -1315,9 +1403,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Bug #10: a NUL-separated list keeps zero-length entries so each can be
-    /// diagnosed with its record number, and a trailing separator does not
-    /// invent a final empty name.
     #[test]
     fn files0_list_preserves_empty_names_but_not_a_trailing_separator() {
         let dir = std::env::temp_dir().join("fastwc_files0_test");
@@ -1330,22 +1415,20 @@ mod tests {
         };
 
         assert_eq!(read(b"a\0b\0"), vec![OsString::from("a"), OsString::from("b")]);
-        // No trailing separator is still two names.
+
         assert_eq!(read(b"a\0b"), vec![OsString::from("a"), OsString::from("b")]);
-        // The empty middle entry survives, as record 2.
+
         assert_eq!(
             read(b"a\0\0b\0"),
             vec![OsString::from("a"), OsString::new(), OsString::from("b")]
         );
-        // An empty list is empty, not one empty name.
+
         assert_eq!(read(b""), Vec::<OsString>::new());
         assert_eq!(read(b"\0"), vec![OsString::new()]);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Bug #9: a read failure still yields the counts gathered before it, so
-    /// the row is printed and the diagnostic follows.
     #[test]
     fn read_errors_keep_the_counts_gathered_so_far() {
         struct FailsAfterOneRead(bool);
@@ -1368,4 +1451,3 @@ mod tests {
         assert!(out.read_err.is_some(), "the error must still be reported");
     }
 }
-

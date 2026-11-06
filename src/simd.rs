@@ -1,20 +1,3 @@
-//! Copyright 2026 CallMeAlphabet (ItzAlphabet)
-//!
-//! Licensed under the Apache License, Version 2.0 (the "License");
-//! you may not use this file except in compliance with the License.
-//! You may obtain a copy of the License at
-//!
-//!    http://www.apache.org/licenses/LICENSE-2.0
-//!
-//! Unless required by applicable law or agreed to in writing, software
-//! distributed under the License is distributed on an "AS IS" BASIS,
-//! WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//! See the License for the specific language governing permissions and
-//! limitations under the License.
-
-//! Portable SIMD counting kernel for fastwc.
-//! LLVM lowers `Simd<u8, 32>` to AVX2 on x86_64 and NEON (2×16) on aarch64.
-
 use crate::ws::{self, WsMode};
 
 const LANE: usize = 32;
@@ -24,7 +7,6 @@ use std::arch::x86_64 as arch;
 #[cfg(target_arch = "x86")]
 use std::arch::x86 as arch;
 
-/// One 32-byte lane and the mask type it compares into.
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 mod lane {
     use super::arch::*;
@@ -115,8 +97,6 @@ mod lane {
     }
 }
 
-/// Same lane API on plain arrays for every other architecture; the compiler
-/// auto-vectorises these loops with whatever the target offers.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
 mod lane {
     use super::LANE;
@@ -213,8 +193,6 @@ mod lane {
 
 use lane::{M, V};
 
-/// Kept for debug output / ABI compatibility; true when the AVX2 lane code
-/// can run on this CPU. Every entry point is dispatched on the same check.
 pub fn avx2_available() -> bool {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     {
@@ -248,12 +226,34 @@ fn eq_splat(chunk: V, b: u8) -> M {
 
 #[inline(always)]
 fn ascii_ws_mask(chunk: V) -> M {
-    eq_splat(chunk, b'\n')
-        | eq_splat(chunk, b' ')
-        | eq_splat(chunk, b'\t')
-        | eq_splat(chunk, 0x0b)
-        | eq_splat(chunk, 0x0c)
-        | eq_splat(chunk, b'\r')
+    (chunk.simd_ge(V::splat(0x09)) & chunk.simd_le(V::splat(0x0d))) | eq_splat(chunk, b' ')
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2")]
+unsafe fn count_lines_avx2(data: &[u8]) -> u64 {
+    let mut lines = 0u64;
+    let mut i = 0usize;
+    while i + 4 * LANE <= data.len() {
+        lines += bitmask(eq_splat(load_at(data, i), b'\n')).count_ones() as u64;
+        lines += bitmask(eq_splat(load_at(data, i + LANE), b'\n')).count_ones() as u64;
+        lines += bitmask(eq_splat(load_at(data, i + 2 * LANE), b'\n')).count_ones() as u64;
+        lines += bitmask(eq_splat(load_at(data, i + 3 * LANE), b'\n')).count_ones() as u64;
+        i += 4 * LANE;
+    }
+    while i + LANE <= data.len() {
+        lines += bitmask(eq_splat(load_at(data, i), b'\n')).count_ones() as u64;
+        i += LANE;
+    }
+    lines + data[i..].iter().filter(|&&b| b == b'\n').count() as u64
+}
+
+pub fn count_lines(data: &[u8]) -> u64 {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    if avx2_available() {
+        return unsafe { count_lines_avx2(data) };
+    }
+    data.iter().filter(|&&b| b == b'\n').count() as u64
 }
 
 fn count_buf_portable(data: &[u8], carry_in: bool, want_chars: bool) -> (u64, u64, u64, u64, bool) {
@@ -282,6 +282,102 @@ fn count_buf_unicode(
     ws::count_scalar_unicode(data, carry_in, want_chars, mode)
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2")]
+unsafe fn find_line_control_avx2(data: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i + LANE <= data.len() {
+        let chunk = load_at(data, i);
+        let mask = eq_splat(chunk, b'\n') | eq_splat(chunk, b'\t') | eq_splat(chunk, b'\r') | eq_splat(chunk, 0x0c);
+        let bits = bitmask(mask);
+        if bits != 0 {
+            return i + bits.trailing_zeros() as usize;
+        }
+        i += LANE;
+    }
+    while i < data.len() {
+        if matches!(data[i], b'\n' | b'\t' | b'\r' | 0x0c) { break; }
+        i += 1;
+    }
+    i
+}
+
+pub fn find_line_control(data: &[u8], start: usize) -> usize {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    if avx2_available() {
+        return unsafe { find_line_control_avx2(data, start) };
+    }
+    let mut i = start;
+    while i < data.len() {
+        if matches!(data[i], b'\n' | b'\t' | b'\r' | 0x0c) { break; }
+        i += 1;
+    }
+    i
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2")]
+unsafe fn segment_width_avx2(data: &[u8], unicode: bool) -> i64 {
+    let mut width = 0i64;
+    let mut i = 0usize;
+    while i + LANE + 5 <= data.len() {
+        let chunk = load_at(data, i);
+        let printable = chunk.simd_ge(V::splat(0x20)) & chunk.simd_le(V::splat(0x7e));
+        width += bitmask(printable).count_ones() as i64;
+        if unicode {
+            let mut high = arch::_mm256_movemask_epi8(chunk.0) as u32 as u64;
+            while high != 0 {
+                let pos = high.trailing_zeros() as usize;
+                let (cp, len, valid) = ws::decode(data, i + pos);
+                if valid {
+                    width += ws::display_width(cp, true);
+                }
+                high &= !(((1u64 << len) - 1) << pos);
+            }
+        }
+        i += LANE;
+    }
+    while i < data.len() {
+        let b = data[i];
+        if (0x20..=0x7e).contains(&b) {
+            width += 1;
+            i += 1;
+        } else if b >= 0x80 && unicode {
+            let (cp, len, valid) = ws::decode(data, i);
+            if valid {
+                width += ws::display_width(cp, true);
+            }
+            i += len;
+        } else {
+            i += 1;
+        }
+    }
+    width
+}
+
+pub fn segment_width(data: &[u8], unicode: bool) -> i64 {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    if avx2_available() {
+        return unsafe { segment_width_avx2(data, unicode) };
+    }
+    let mut width = 0i64;
+    let mut i = 0usize;
+    while i < data.len() {
+        let b = data[i];
+        if (0x20..=0x7e).contains(&b) {
+            width += 1;
+            i += 1;
+        } else if b >= 0x80 && unicode {
+            let (cp, len, valid) = ws::decode(data, i);
+            if valid { width += ws::display_width(cp, true); }
+            i += len;
+        } else {
+            i += 1;
+        }
+    }
+    width
+}
+
 pub fn simple_ascii_run(data: &[u8], start: usize, carry_ws: bool, avx2: bool) -> (usize, u64, bool) {
     if avx2 {
         return unsafe { simple_ascii_run_impl(data, start, carry_ws) };
@@ -291,6 +387,61 @@ pub fn simple_ascii_run(data: &[u8], start: usize, carry_ws: bool, avx2: bool) -
 
 pub fn count_buf(data: &[u8], carry_in: bool, want_chars: bool) -> (u64, u64, u64, u64, bool) {
     count_buf_portable(data, carry_in, want_chars)
+}
+
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), target_feature(enable = "avx2"))]
+fn count_words_impl(data: &[u8], carry_in: bool, mode: WsMode) -> (u64, u64, bool) {
+    let mut words = 0u64;
+    let mut carry = carry_in;
+    let mut i = 0usize;
+    if !mode.unicode {
+        if mode.nbsp {
+            while i + LANE <= data.len() {
+                let chunk = load_at(data, i);
+                let ws_bits = bitmask(ascii_ws_mask(chunk) | eq_splat(chunk, ws::NBSP_BYTE));
+                words += (!ws_bits & ((ws_bits << 1) | (carry as u32))).count_ones() as u64;
+                carry = (ws_bits >> (LANE - 1)) & 1 == 1;
+                i += LANE;
+            }
+        } else {
+            while i + LANE <= data.len() {
+                let ws_bits = bitmask(ascii_ws_mask(load_at(data, i)));
+                words += (!ws_bits & ((ws_bits << 1) | (carry as u32))).count_ones() as u64;
+                carry = (ws_bits >> (LANE - 1)) & 1 == 1;
+                i += LANE;
+            }
+        }
+        let (_, tail_words, _, _, tail_carry) = if mode.nbsp {
+            count_unibyte_nbsp_scalar(&data[i..], carry)
+        } else {
+            count_buf_scalar(&data[i..], carry, false)
+        };
+        return (words + tail_words, data.len() as u64, tail_carry);
+    }
+    let mut ws_carry = 0u32;
+    while i + LANE + 3 <= data.len() {
+        let chunk = load_at(data, i);
+        let ascii_ws_bits = bitmask(ascii_ws_mask(chunk));
+        let (ws2, ws3) = ws_seq_masks_impl(data, i, mode.nbsp);
+        let wide = ((ws2 as u64) | ((ws2 as u64) << 1))
+            | ((ws3 as u64) | ((ws3 as u64) << 1) | ((ws3 as u64) << 2));
+        let ws_all = ascii_ws_bits | (wide as u32) | ws_carry;
+        ws_carry = (wide >> LANE) as u32;
+        words += (!ws_all & ((ws_all << 1) | (carry as u32))).count_ones() as u64;
+        carry = (ws_all >> (LANE - 1)) & 1 == 1;
+        i += LANE;
+    }
+    i += ws_carry.count_ones() as usize;
+    let (_, tail_words, _, _, tail_carry) = ws::count_scalar_unicode(&data[i..], carry, false, mode);
+    (words + tail_words, data.len() as u64, tail_carry)
+}
+
+pub fn count_words_mode(data: &[u8], carry_in: bool, mode: WsMode) -> (u64, u64, bool) {
+    if avx2_available() {
+        return unsafe { count_words_impl(data, carry_in, mode) };
+    }
+    let (_, words, bytes, _, carry) = count_buf_mode(data, carry_in, false, mode);
+    (words, bytes, carry)
 }
 
 pub fn count_buf_mode(
@@ -398,7 +549,6 @@ fn count_buf_portable_impl(data: &[u8], carry_in: bool, want_chars: bool) -> (u6
     (lines + t_lines, words + t_words, data.len() as u64, chars + t_chars, t_carry)
 }
 
-/// Positions of 2-byte and 3-byte whitespace leads in one 32-byte lane.
 #[cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), target_feature(enable = "avx2"))]
 fn ws_seq_masks_impl(data: &[u8], i: usize, nbsp: bool) -> (u32, u32) {
     let chunk = load_at(data, i);
@@ -427,31 +577,146 @@ fn ws_seq_masks_impl(data: &[u8], i: usize, nbsp: bool) -> (u32, u32) {
         0
     };
 
-    // U+2000..U+2006, U+2008..U+200A (and U+2007 if GNU)
-    // After xor 0x80 the low separators' final bytes 0x80..=0x8A land in 0x00..=0x0A.
     let t = next2 ^ high;
     let mut low = t.simd_le(V::splat(0x0A));
     if !nbsp {
-        low &= !t.simd_eq(V::splat(0x07)); // U+2007
+        low &= !t.simd_eq(V::splat(0x07));
     }
-    let mut sep = (t & V::splat(0xfe)).simd_eq(V::splat(0x28)); // 0xa8 ^ 0x80 = 0x28 (U+2028/2029)
+    let mut sep = (t & V::splat(0xfe)).simd_eq(V::splat(0x28));
     if nbsp {
-        sep |= t.simd_eq(V::splat(0x2F)); // 0xaf ^ 0x80
+        sep |= t.simd_eq(V::splat(0x2F));
     }
-    let mut narrow = t.simd_eq(V::splat(0x1F)); // 0x9f ^ 0x80 U+205F
+    let mut narrow = t.simd_eq(V::splat(0x1F));
     if nbsp {
-        narrow |= t.simd_eq(V::splat(0x20)); // U+2060
+        narrow |= t.simd_eq(V::splat(0x20));
     }
     let e2_hit = (at1_80 & (low | sep)) | (at1_81 & narrow);
     let hit = (is_e2 & e2_hit) | (at2_80 & ((is_e1 & at1_9a) | (is_e3 & at1_80)));
     (ws2, bitmask(hit))
 }
 
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "x86"), target_feature(enable = "avx2"))]
+fn count_valid_utf8_chars_impl(data: &[u8]) -> u64 {
+    let mut chars = 0u64;
+    let mut i = 0usize;
+    let cont_mask = V::splat(0xC0);
+    let cont_tag = V::splat(0x80);
+    while i + LANE <= data.len() {
+        let chunk = load_at(data, i);
+        let is_cont = (chunk & cont_mask).simd_eq(cont_tag);
+        chars += (LANE as u32 - bitmask(is_cont).count_ones()) as u64;
+        i += LANE;
+    }
+    chars + data[i..].iter().filter(|&&b| b & 0xC0 != 0x80).count() as u64
+}
+
+fn count_valid_utf8_chars(data: &[u8]) -> u64 {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    if avx2_available() {
+        return unsafe { count_valid_utf8_chars_impl(data) };
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+    {
+        count_valid_utf8_chars_impl(data)
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        data.iter().filter(|&&b| b & 0xC0 != 0x80).count() as u64
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2")]
+unsafe fn count_unicode_chars_avx2(data: &[u8]) -> u64 {
+    let mut chars = 0u64;
+    let mut i = 0usize;
+    let cont_mask = V::splat(0xC0);
+    let cont_tag = V::splat(0x80);
+    while i + LANE + 5 <= data.len() {
+        let chunk = load_at(data, i);
+        let next1 = V::from_slice(&data[i + 1..i + 1 + LANE]);
+        let next2 = V::from_slice(&data[i + 2..i + 2 + LANE]);
+        let next3 = V::from_slice(&data[i + 3..i + 3 + LANE]);
+        let next4 = V::from_slice(&data[i + 4..i + 4 + LANE]);
+        let next5 = V::from_slice(&data[i + 5..i + 5 + LANE]);
+        let cont1 = bitmask((next1 & cont_mask).simd_eq(cont_tag));
+        let cont2 = bitmask((next2 & cont_mask).simd_eq(cont_tag));
+        let cont3 = bitmask((next3 & cont_mask).simd_eq(cont_tag));
+        let cont4 = bitmask((next4 & cont_mask).simd_eq(cont_tag));
+        let cont5 = bitmask((next5 & cont_mask).simd_eq(cont_tag));
+        let range = |v: V, lo: u8, hi: u8| bitmask(v.simd_ge(V::splat(lo)) & v.simd_le(V::splat(hi)));
+
+        let lead2 = range(chunk, 0xC2, 0xDF);
+        let lead3 = range(chunk, 0xE0, 0xEF);
+        let lead4 = range(chunk, 0xF0, 0xF7);
+        let lead5 = range(chunk, 0xF8, 0xFB);
+        let lead6 = range(chunk, 0xFC, 0xFD);
+        let valid2 = lead2 & cont1;
+
+        let e0 = bitmask(eq_splat(chunk, 0xE0));
+        let ed = bitmask(eq_splat(chunk, 0xED));
+        let valid3_start = (lead3 & !e0 & !ed)
+            | (e0 & range(next1, 0xA0, 0xBF))
+            | (ed & range(next1, 0x80, 0x9F));
+        let valid3 = valid3_start & cont1 & cont2;
+
+        let f0 = bitmask(eq_splat(chunk, 0xF0));
+        let valid4_start = (lead4 & !f0) | (f0 & range(next1, 0x90, 0xBF));
+        let valid4 = valid4_start & cont1 & cont2 & cont3;
+
+        let f8 = bitmask(eq_splat(chunk, 0xF8));
+        let valid5_start = (lead5 & !f8) | (f8 & range(next1, 0x88, 0xBF));
+        let valid5 = valid5_start & cont1 & cont2 & cont3 & cont4;
+
+        let fc = bitmask(eq_splat(chunk, 0xFC));
+        let valid6_start = (lead6 & !fc) | (fc & range(next1, 0x84, 0xBF));
+        let valid6 = valid6_start & cont1 & cont2 & cont3 & cont4 & cont5;
+
+        let high = arch::_mm256_movemask_epi8(chunk.0) as u32;
+        chars += (LANE as u32 - high.count_ones()) as u64;
+        chars += valid2.count_ones() as u64;
+        chars += valid3.count_ones() as u64;
+        chars += valid4.count_ones() as u64;
+        chars += valid5.count_ones() as u64;
+        chars += valid6.count_ones() as u64;
+        i += LANE;
+    }
+    chars + count_unicode_chars_scalar(&data[i..])
+}
+
+fn count_unicode_chars(data: &[u8]) -> u64 {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    if avx2_available() {
+        return unsafe { count_unicode_chars_avx2(data) };
+    }
+    count_unicode_chars_scalar(data)
+}
+
+fn count_unicode_chars_scalar(data: &[u8]) -> u64 {
+    let mut chars = 0u64;
+    let mut i = 0usize;
+    while i < data.len() {
+        let b = data[i];
+        if b < 0x80 {
+            chars += 1;
+            i += 1;
+        } else {
+            let (_, len, valid) = ws::decode(data, i);
+            chars += valid as u64;
+            i += len;
+        }
+    }
+    chars
+}
+
 pub fn count_chars_only(data: &[u8], mode: WsMode) -> u64 {
-    if !mode.unicode {
+    if !mode.unicode || !data.iter().any(|&b| b >= 0x80) {
         return data.len() as u64;
     }
-    ws::count_scalar_unicode(data, true, true, mode).3
+    if std::str::from_utf8(data).is_ok() {
+        return count_valid_utf8_chars(data);
+    }
+    count_unicode_chars(data)
 }
 
 #[cfg(test)]
@@ -475,13 +740,15 @@ fn count_buf_unicode_impl(
     want_chars: bool,
     mode: WsMode,
 ) -> (u64, u64, u64, u64, bool) {
-    // Only -m needs every sequence decoded; use the scalar decoder for that
-    // (still vectorised via count_buf_portable for ASCII-only).
+
     if want_chars {
-        if data.iter().any(|&b| b >= 0x80) {
-            return ws::count_scalar_unicode(data, carry_in, want_chars, mode);
+        if !data.iter().any(|&b| b >= 0x80) {
+            return count_buf_portable_impl(data, carry_in, true);
         }
-        return count_buf_portable_impl(data, carry_in, true);
+        let valid_utf8 = std::str::from_utf8(data).is_ok();
+        let (lines, words, bytes, _, carry) = count_buf_unicode_impl(data, carry_in, false, mode);
+        let chars = if valid_utf8 { count_valid_utf8_chars(data) } else { count_unicode_chars(data) };
+        return (lines, words, bytes, chars, carry);
     }
     let mut lines = 0u64;
     let mut words = 0u64;

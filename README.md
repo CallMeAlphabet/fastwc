@@ -35,18 +35,32 @@ fastwc /path/to/file
 
 ## Benchmarks
 
-These are Hyperfine wall-clock means from 2 runs with `LC_ALL=C.utf8`, default counting mode, and stdout redirected to `/dev/null`. Times are reported as mean ± standard deviation.
-
-| File | Mode | Tool | Mean wall time | fastwc speedup |
+| Input | Mode | Tool | Mean wall time | Opponent relative to fastwc |
 |---|---|---|---:|---:|
-| **random-5GiB.bin** | **default** | **fastwc 0.2.7** | **4.790 ± 0.673 s** | **—** |
-| random-5GiB.bin | default | GNU wc | 81.301 ± 0.209 s | 17.0× |
-| random-5GiB.bin | default | cw | 15.711 ± 0.032 s | 3.3× |
+| **random-5GiB.bin, one file** | **default** | **fastwc 0.2.7** | **1.169 ± 0.171 s** | **—** |
+| random-5GiB.bin, one file | default | GNU wc | 84.274 ± 1.053 s | 72.1× slower |
+| random-5GiB.bin, one file | default | cw | 15.124 ± 0.137 s | 12.9× slower |
+| **random-5GiB.parts, four files** | **default** | **fastwc 0.2.7** | **3.957 ± 0.285 s** | **—** |
+| random-5GiB.parts, four files | default | GNU wc | 89.419 ± 4.285 s | 22.6× slower |
+| random-5GiB.parts, four files | default | cw | 7.344 ± 0.775 s | 1.9× slower |
 
 Reproduce with Hyperfine:
 
 ```bash
-hyperfine --shell=default --warmup 0 --runs 2   'LC_ALL=C.utf8 ./target/release/fastwc "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'   'LC_ALL=C.utf8 wc "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'   'LC_ALL=C.utf8 /tmp/cw-0.7.0/bin/cw --threads=2 "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'
+hyperfine --shell=default --warmup 0 --runs 2 \
+  'LC_ALL=C.utf8 ./target/release/fastwc "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null' \
+  'LC_ALL=C.utf8 wc "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null' \
+  'LC_ALL=C.utf8 /tmp/cw-0.7.0/bin/cw --threads=4 "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'
+
+mkdir -p "$HOME/benchmark-inputs/random-5GiB.parts"
+split -n 4 -d -a 3 \
+  "$HOME/benchmark-inputs/random-5GiB.bin" \
+  "$HOME/benchmark-inputs/random-5GiB.parts/part-"
+
+hyperfine --shell=default --warmup 0 --runs 2 \
+  'LC_ALL=C.utf8 ./target/release/fastwc "$HOME"/benchmark-inputs/random-5GiB.parts/part-* > /dev/null' \
+  'LC_ALL=C.utf8 wc "$HOME"/benchmark-inputs/random-5GiB.parts/part-* > /dev/null' \
+  'LC_ALL=C.utf8 /tmp/cw-0.7.0/bin/cw --threads=4 "$HOME"/benchmark-inputs/random-5GiB.parts/part-* > /dev/null'
 ```
 
 ## Uninstall
